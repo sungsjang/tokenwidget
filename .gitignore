@@ -1,0 +1,12 @@
+# Build artifacts and local executable packages
+codex_usage_widget/build/
+codex_usage_widget/dist/
+codex_usage_widget/*.exe
+codex_usage_widget/*.spec
+codex_usage_widget/__pycache__/
+
+# Local investigation outputs
+codex_usage_widget/protocol-schema/
+codex_usage_widget/inspect_local_data.py
+codex_usage_widget/probe_app_server.py
+codex_usage_widget/probe_http.py
