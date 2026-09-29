@@ -56,6 +56,15 @@ class UsageParsingTests(unittest.TestCase):
         self.assertEqual(len(result.reset_credits), 1)
         self.assertEqual(result.reset_credits[0].title, "Full reset")
 
+    def test_identifies_windows_by_duration_when_order_changes(self):
+        usage = {"rate_limit": {
+            "primary_window": {"used_percent": 60, "limit_window_seconds": 604800, "reset_at": 1787406780},
+            "secondary_window": {"used_percent": 20, "limit_window_seconds": 18000, "reset_at": 1786974780},
+        }}
+        result = _account_from_payloads(usage, {})
+        self.assertEqual(result.usage.remaining_percent, 80)
+        self.assertEqual(result.weekly_usage.remaining_percent, 40)
+
     def test_dual_clock_uses_all_three_final_timezones(self):
         moment = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(format_clock(moment, "Asia/Seoul")[0], "09:00:00")

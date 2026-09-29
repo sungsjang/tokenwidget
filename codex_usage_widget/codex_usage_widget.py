@@ -65,7 +65,7 @@ class ResetCredit:
 
 @dataclass(frozen=True)
 class AccountUsage:
-    usage: Usage
+    usage: Usage | None
     weekly_usage: Usage | None
     reset_count: int
     reset_credits: tuple[ResetCredit, ...]
@@ -130,8 +130,10 @@ def _windows_from_line(raw: bytes) -> UsageSnapshot | None:
                 plan_type=str(limits.get("plan_type") or ""),
             )
 
-        primary = parse_window(limits.get("primary") or {})
-        weekly = parse_window(limits.get("secondary") or {})
+        windows = [parsed for name in ("primary", "secondary")
+                   if (parsed := parse_window(limits.get(name) or {}))]
+        primary = next((item for item in windows if item.window_minutes == 300), None)
+        weekly = next((item for item in windows if item.window_minutes == 10080), None)
         return UsageSnapshot(primary, weekly) if primary or weekly else None
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
@@ -177,8 +179,10 @@ def _account_from_payloads(usage_data: dict, credits_data: dict) -> AccountUsage
             plan_type=str(usage_data.get("plan_type") or ""),
         )
 
-    usage = parse_window(limits["primary_window"])
-    weekly = parse_window(limits.get("secondary_window"))
+    windows = [parsed for name in ("primary_window", "secondary_window")
+               if (parsed := parse_window(limits.get(name)))]
+    usage = next((item for item in windows if item.window_minutes == 300), None)
+    weekly = next((item for item in windows if item.window_minutes == 10080), None)
     credits = []
     for item in credits_data.get("credits") or []:
         if item.get("status") != "available" or not item.get("expires_at"):
@@ -629,7 +633,7 @@ class UsageWidget:
     def _apply_account_usage(self, result: AccountUsage | None) -> None:
         self.fetching = False
         if result:
-            self.usage = result.usage
+            self.usage = result.usage or self.usage
             self.weekly_usage = result.weekly_usage or self.weekly_usage
             self.reset_count = result.reset_count
             self.reset_credits = result.reset_credits
