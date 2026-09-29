@@ -10,17 +10,23 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 
+from openrouter_credit import fetch_credits, load_key, save_key
+
 
 APP_NAME = "Codex Usage Widget"
-APP_VERSION = "1.0"
+APP_VERSION = "2.5"
 WIDTH = 286
 CLOCK_HEIGHT = 58
 PANEL_WIDTH = WIDTH // 3
-COLLAPSED_HEIGHT = CLOCK_HEIGHT + 116
+CODEX_SECTION_HEIGHT = 122
+RESET_SECTION_HEIGHT = 33
+OPENROUTER_SECTION_HEIGHT = 44
+COLLAPSED_HEIGHT = CLOCK_HEIGHT + CODEX_SECTION_HEIGHT + RESET_SECTION_HEIGHT + OPENROUTER_SECTION_HEIGHT
 RESET_ROW_HEIGHT = 47
 REFRESH_MS = 60_000
 TIME_SYNC_INTERVAL_MS = 60 * 60 * 1000
@@ -29,7 +35,7 @@ TRANSPARENT = "#ff00ff"
 WATCH_ZONES = (
     ("SEOUL", "Asia/Seoul", "#ff7aa2"),
     ("VANCOUVER", "America/Vancouver", "#5d8cff"),
-    ("LONDON", "Europe/London", "#60b886"),
+    ("UTC", "Etc/UTC", "#60b886"),
 )
 TIME_SOURCES = (
     "https://worldtimeapi.org/api/timezone/Etc/UTC",
@@ -60,8 +66,15 @@ class ResetCredit:
 @dataclass(frozen=True)
 class AccountUsage:
     usage: Usage
+    weekly_usage: Usage | None
     reset_count: int
     reset_credits: tuple[ResetCredit, ...]
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    primary: Usage | None
+    weekly: Usage | None
 
 
 def codex_home() -> Path:
@@ -73,7 +86,7 @@ def _parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _read_latest_usage(path: Path) -> Usage | None:
+def _read_latest_windows(path: Path) -> UsageSnapshot | None:
     """Read a JSONL file backwards and return its newest rate-limit record."""
     try:
         with path.open("rb") as stream:
@@ -88,36 +101,43 @@ def _read_latest_usage(path: Path) -> Usage | None:
                 lines = pending.split(b"\n")
                 pending = lines[0]
                 for raw in reversed(lines[1:]):
-                    usage = _usage_from_line(raw)
-                    if usage:
-                        return usage
-            return _usage_from_line(pending)
+                    snapshot = _windows_from_line(raw)
+                    if snapshot:
+                        return snapshot
+            return _windows_from_line(pending)
     except (OSError, PermissionError):
         return None
 
 
-def _usage_from_line(raw: bytes) -> Usage | None:
+def _windows_from_line(raw: bytes) -> UsageSnapshot | None:
     if b'"rate_limits"' not in raw or b'"token_count"' not in raw:
         return None
     try:
         record = json.loads(raw)
         payload = record.get("payload", {})
         limits = payload.get("rate_limits") or {}
-        primary = limits.get("primary") or {}
-        if "used_percent" not in primary:
+        if not limits.get("primary") and not limits.get("secondary"):
             return None
-        return Usage(
-            used_percent=float(primary["used_percent"]),
-            window_minutes=int(primary.get("window_minutes") or 0),
-            resets_at=int(primary.get("resets_at") or 0),
-            timestamp=_parse_timestamp(record["timestamp"]),
-            plan_type=str(limits.get("plan_type") or ""),
-        )
+
+        def parse_window(window: dict) -> Usage | None:
+            if "used_percent" not in window:
+                return None
+            return Usage(
+                used_percent=float(window["used_percent"]),
+                window_minutes=int(window.get("window_minutes") or 0),
+                resets_at=int(window.get("resets_at") or 0),
+                timestamp=_parse_timestamp(record["timestamp"]),
+                plan_type=str(limits.get("plan_type") or ""),
+            )
+
+        primary = parse_window(limits.get("primary") or {})
+        weekly = parse_window(limits.get("secondary") or {})
+        return UsageSnapshot(primary, weekly) if primary or weekly else None
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
 
 
-def find_latest_usage(home: Path | None = None) -> Usage | None:
+def find_latest_windows(home: Path | None = None) -> UsageSnapshot | None:
     sessions = (home or codex_home()) / "sessions"
     if not sessions.exists():
         return None
@@ -128,8 +148,13 @@ def find_latest_usage(home: Path | None = None) -> Usage | None:
     except OSError:
         return None
 
-    found = [usage for path in candidates if (usage := _read_latest_usage(path))]
-    return max(found, key=lambda item: item.timestamp) if found else None
+    found = [snapshot for path in candidates if (snapshot := _read_latest_windows(path))]
+    return max(found, key=lambda item: (item.primary or item.weekly).timestamp) if found else None
+
+
+def find_latest_usage(home: Path | None = None) -> Usage | None:
+    snapshot = find_latest_windows(home)
+    return snapshot.primary if snapshot else None
 
 
 def _get_json(url: str, headers: dict[str, str]) -> dict:
@@ -139,14 +164,21 @@ def _get_json(url: str, headers: dict[str, str]) -> dict:
 
 
 def _account_from_payloads(usage_data: dict, credits_data: dict) -> AccountUsage:
-    window = usage_data["rate_limit"]["primary_window"]
-    usage = Usage(
-        used_percent=float(window["used_percent"]),
-        window_minutes=round(int(window["limit_window_seconds"]) / 60),
-        resets_at=int(window["reset_at"]),
-        timestamp=datetime.now(timezone.utc),
-        plan_type=str(usage_data.get("plan_type") or ""),
-    )
+    limits = usage_data["rate_limit"]
+
+    def parse_window(window: dict | None) -> Usage | None:
+        if not window:
+            return None
+        return Usage(
+            used_percent=float(window["used_percent"]),
+            window_minutes=round(int(window["limit_window_seconds"]) / 60),
+            resets_at=int(window["reset_at"]),
+            timestamp=datetime.now(timezone.utc),
+            plan_type=str(usage_data.get("plan_type") or ""),
+        )
+
+    usage = parse_window(limits["primary_window"])
+    weekly = parse_window(limits.get("secondary_window"))
     credits = []
     for item in credits_data.get("credits") or []:
         if item.get("status") != "available" or not item.get("expires_at"):
@@ -160,6 +192,7 @@ def _account_from_payloads(usage_data: dict, credits_data: dict) -> AccountUsage
     credits.sort(key=lambda item: item.expires_at)
     return AccountUsage(
         usage=usage,
+        weekly_usage=weekly,
         reset_count=int(credits_data.get("available_count", len(credits))),
         reset_credits=tuple(credits),
     )
@@ -288,8 +321,13 @@ class UsageWidget:
         self.always_on_top = tk.BooleanVar(value=bool(self.settings.get("always_on_top", True)))
         self.expanded = False
         self.usage: Usage | None = None
+        self.weekly_usage: Usage | None = None
         self.reset_count: int | None = None
         self.reset_credits: tuple[ResetCredit, ...] = ()
+        self.openrouter_balance = None
+        self.openrouter_status = "키 설정" if not load_key() else "확인 중"
+        self.openrouter_fetching = False
+        self.openrouter_after_id: str | None = None
         self.fetching = False
         self.after_id: str | None = None
         self.clock_tick_after_id: str | None = None
@@ -308,8 +346,25 @@ class UsageWidget:
         self._bind_actions()
         self._drag_origin: tuple[int, int, int, int] | None = None
         self.refresh()
+        self.refresh_openrouter()
         self.tick_clock()
         self.sync_clock_now()
+
+    def _draw_limit(self, top: int, title: str, usage: Usage | None) -> None:
+        self.canvas.create_text(16, top, text=title, anchor="w", fill="#202124", font=("Malgun Gothic", 8, "bold"))
+        percent = f"{usage.remaining_percent}%" if usage else "--%"
+        self.canvas.create_text(WIDTH - 37, top, text=percent, anchor="e", fill="#202124", font=("Malgun Gothic", 12, "bold"))
+        self.canvas.create_text(WIDTH - 25, top, text="남음", anchor="w", fill="#777777", font=("Malgun Gothic", 7))
+        rounded_rect(self.canvas, 16, top + 14, WIDTH - 16, top + 21, 3, fill="#e6e6e6", outline="")
+        if usage and usage.remaining_percent > 0:
+            bar_right = 16 + max(2, (WIDTH - 32) * usage.remaining_percent / 100)
+            rounded_rect(self.canvas, 16, top + 14, bar_right, top + 21, 3, fill="#202124", outline="")
+        if usage and usage.resets_at:
+            reset = datetime.fromtimestamp(usage.resets_at)
+            status = f"{reset.month}월 {reset.day}일 {reset:%H:%M} 재설정"
+        else:
+            status = "한도 정보를 찾는 중…"
+        self.canvas.create_text(16, top + 33, text=status, anchor="w", fill="#777777", font=("Malgun Gothic", 7))
 
     def _draw(self) -> None:
         row_count = len(self.reset_credits) if self.expanded else 0
@@ -331,32 +386,20 @@ class UsageWidget:
             clock_text, date_text = format_clock(utc_now, tz_name)
             self.canvas.create_text(x + PANEL_WIDTH // 2, 30, text=clock_text, fill="#202124", font=("Consolas", 11, "bold"), tags=(f"clock_time_{index}",))
             self.canvas.create_text(x + PANEL_WIDTH // 2, 48, text=date_text, fill="#888888", font=("Segoe UI", 6), tags=(f"clock_date_{index}",))
-        self.canvas.create_line(12, CLOCK_HEIGHT, WIDTH - 12, CLOCK_HEIGHT, fill="#ededed")
-
-        usage_y = CLOCK_HEIGHT
-        self.canvas.create_text(16, usage_y + 17, text="CODEX", anchor="w", fill="#202124", font=("Segoe UI", 9, "bold"))
-        label = window_label(self.usage.window_minutes) if self.usage else "월간 한도"
-        self.canvas.create_text(65, usage_y + 17, text=label, anchor="w", fill="#777777", font=("Malgun Gothic", 8))
-        percent = f"{self.usage.remaining_percent}%" if self.usage else "--%"
-        self.canvas.create_text(WIDTH - 37, usage_y + 17, text=percent, anchor="e", fill="#202124", font=("Malgun Gothic", 13, "bold"))
-        self.canvas.create_text(WIDTH - 25, usage_y + 17, text="남음", anchor="w", fill="#777777", font=("Malgun Gothic", 7))
         self.canvas.create_oval(WIDTH - 24, 4, WIDTH - 7, 21, fill="#f4f4f4", outline="", tags=("close",))
         self.canvas.create_text(WIDTH - 15.5, 12.5, text="×", fill="#666666", font=("Segoe UI", 10, "bold"), tags=("close",))
+        self.canvas.create_line(12, CLOCK_HEIGHT, WIDTH - 12, CLOCK_HEIGHT, fill="#ededed")
 
-        rounded_rect(self.canvas, 16, usage_y + 38, WIDTH - 16, usage_y + 46, 4, fill="#e6e6e6", outline="")
-        bar_right = 17 if not self.usage else 16 + max(1, (WIDTH - 32) * self.usage.remaining_percent / 100)
-        rounded_rect(self.canvas, 16, usage_y + 38, bar_right, usage_y + 46, 4, fill="#202124", outline="")
-        if self.usage and self.usage.resets_at:
-            reset = datetime.fromtimestamp(self.usage.resets_at)
-            updated = self.usage.timestamp.astimezone().strftime("%H:%M 갱신")
-            status = f"{reset.month}월 {reset.day}일 재설정  ·  {updated}"
-        else:
-            status = "Codex 데이터를 찾는 중…"
-        self.canvas.create_text(16, usage_y + 67, text=status, anchor="w", fill="#777777", font=("Malgun Gothic", 8))
-        self.canvas.create_text(WIDTH - 16, usage_y + 67, text="↻", anchor="e", fill="#888888", font=("Segoe UI Symbol", 12), tags=("refresh",))
+        self.canvas.create_text(16, CLOCK_HEIGHT + 14, text="CODEX", anchor="w", fill="#202124", font=("Segoe UI", 9, "bold"))
+        updated = self.usage.timestamp.astimezone().strftime("%H:%M 갱신") if self.usage else "확인 중"
+        self.canvas.create_text(65, CLOCK_HEIGHT + 14, text=updated, anchor="w", fill="#888888", font=("Malgun Gothic", 7))
+        self.canvas.create_text(WIDTH - 16, CLOCK_HEIGHT + 14, text="↻", anchor="e", fill="#888888", font=("Segoe UI Symbol", 12), tags=("refresh",))
+        self._draw_limit(CLOCK_HEIGHT + 33, "5시간 한도", self.usage)
+        self._draw_limit(CLOCK_HEIGHT + 76, "주간 한도", self.weekly_usage)
 
-        self.canvas.create_line(12, usage_y + 85, WIDTH - 12, usage_y + 85, fill="#ededed")
-        self.canvas.create_text(16, usage_y + 101, text="사용 한도 재설정", anchor="w", fill="#202124", font=("Malgun Gothic", 8, "bold"), tags=("reset_header",))
+        reset_y = CLOCK_HEIGHT + CODEX_SECTION_HEIGHT
+        self.canvas.create_line(12, reset_y, WIDTH - 12, reset_y, fill="#ededed")
+        self.canvas.create_text(16, reset_y + 16, text="사용 한도 재설정", anchor="w", fill="#202124", font=("Malgun Gothic", 8, "bold"), tags=("reset_header",))
         if self.reset_count is None:
             badge = "확인 중"
             badge_color = "#f1f1f1"
@@ -366,23 +409,37 @@ class UsageWidget:
             badge_color = "#d9f5e3"
             badge_text = "#087a3e"
         badge_left = WIDTH - 39 - max(52, len(badge) * 8)
-        rounded_rect(self.canvas, badge_left, usage_y + 91, WIDTH - 29, usage_y + 111, 10, fill=badge_color, outline="", tags=("reset_header",))
-        self.canvas.create_text((badge_left + WIDTH - 29) / 2, usage_y + 101, text=badge, fill=badge_text, font=("Malgun Gothic", 8, "bold"), tags=("reset_header",))
-        arrow = "⌃" if self.expanded else "⌄"
-        self.canvas.create_text(WIDTH - 14, usage_y + 100, text=arrow, anchor="e", fill="#888888", font=("Segoe UI Symbol", 10), tags=("reset_header",))
+        rounded_rect(self.canvas, badge_left, reset_y + 6, WIDTH - 29, reset_y + 26, 10, fill=badge_color, outline="", tags=("reset_header",))
+        self.canvas.create_text((badge_left + WIDTH - 29) / 2, reset_y + 16, text=badge, fill=badge_text, font=("Malgun Gothic", 8, "bold"), tags=("reset_header",))
+        self.canvas.create_text(WIDTH - 14, reset_y + 15, text="⌃" if self.expanded else "⌄", anchor="e", fill="#888888", font=("Segoe UI Symbol", 10), tags=("reset_header",))
 
+        detail_top = reset_y + RESET_SECTION_HEIGHT
         for index, credit in enumerate(self.reset_credits if self.expanded else ()):
-            top = COLLAPSED_HEIGHT + index * RESET_ROW_HEIGHT
+            top = detail_top + index * RESET_ROW_HEIGHT
             self.canvas.create_line(12, top, WIDTH - 12, top, fill="#ededed")
-            self.canvas.create_text(16, top + 15, text=credit.title, anchor="w", fill="#202124", font=("Segoe UI", 8, "bold"))
+            self.canvas.create_text(16, top + 15, text=credit.title, anchor="w", fill="#202124", font=("Segoe UI", 8, "bold"), width=180)
             expires = credit.expires_at.astimezone()
             self.canvas.create_text(16, top + 33, text=f"{expires.month}. {expires.day}. 만료", anchor="w", fill="#777777", font=("Malgun Gothic", 8))
             rounded_rect(self.canvas, WIDTH - 82, top + 11, WIDTH - 16, top + 37, 11, fill="#202124", outline="")
             self.canvas.create_text(WIDTH - 49, top + 24, text="사용 가능", fill="#ffffff", font=("Malgun Gothic", 8, "bold"))
 
+        router_y = detail_top + row_count * RESET_ROW_HEIGHT
+        self.canvas.create_line(12, router_y, WIDTH - 12, router_y, fill="#ededed")
+        self.canvas.create_text(16, router_y + 15, text="OpenRouter", anchor="w", fill="#202124", font=("Segoe UI", 9, "bold"))
+        self.canvas.create_text(96, router_y + 15, text="남은 크레딧", anchor="w", fill="#777777", font=("Malgun Gothic", 8))
+        self.canvas.create_text(WIDTH - 16, router_y + 15, text="⚙", anchor="e", fill="#888888", font=("Segoe UI Symbol", 11), tags=("openrouter_settings",))
+        if self.openrouter_balance is None:
+            balance_text = self.openrouter_status
+            balance_color = "#888888" if balance_text in ("키 설정", "확인 중") else "#c34c4c"
+        else:
+            balance_text = f"${self.openrouter_balance:,.2f} USD"
+            balance_color = "#202124"
+        self.canvas.create_text(16, router_y + 32, text=balance_text, anchor="w", fill=balance_color, font=("Consolas", 10, "bold"))
+
         self.canvas.tag_bind("close", "<Button-1>", lambda _event: self.close())
-        self.canvas.tag_bind("refresh", "<Button-1>", lambda _event: self.refresh())
+        self.canvas.tag_bind("refresh", "<Button-1>", lambda _event: self.refresh_all())
         self.canvas.tag_bind("reset_header", "<Button-1>", lambda _event: self._toggle_expanded())
+        self.canvas.tag_bind("openrouter_settings", "<Button-1>", lambda _event: self.openrouter_settings())
 
     def _bind_actions(self) -> None:
         self.canvas.bind("<ButtonPress-1>", self._start_drag)
@@ -392,7 +449,8 @@ class UsageWidget:
 
     def _show_menu(self, event: tk.Event) -> None:
         menu = tk.Menu(self.root, tearoff=False, font=("Malgun Gothic", 9))
-        menu.add_command(label="지금 새로고침", command=self.refresh)
+        menu.add_command(label="지금 새로고침", command=self.refresh_all)
+        menu.add_command(label="OpenRouter 관리용 키 설정", command=self.openrouter_settings)
         menu.add_checkbutton(label="항상 위에 표시", variable=self.always_on_top, command=self._toggle_topmost)
         menu.add_separator()
         menu.add_command(label="끝내기", command=self.close)
@@ -405,7 +463,7 @@ class UsageWidget:
 
     def _start_drag(self, event: tk.Event) -> None:
         tags = self.canvas.gettags("current")
-        if any(tag in tags for tag in ("close", "refresh", "reset_header")):
+        if any(tag in tags for tag in ("close", "refresh", "reset_header", "openrouter_settings")):
             return
         self._drag_origin = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
 
@@ -431,9 +489,10 @@ class UsageWidget:
         self.root.geometry(f"{WIDTH}x{COLLAPSED_HEIGHT}+{x}+{y}")
 
     def refresh(self) -> None:
-        local = find_latest_usage()
+        local = find_latest_windows()
         if local:
-            self.usage = local
+            self.usage = local.primary or self.usage
+            self.weekly_usage = local.weekly or self.weekly_usage
         self._draw()
         if not self.fetching:
             self.fetching = True
@@ -441,6 +500,88 @@ class UsageWidget:
         if self.after_id:
             self.root.after_cancel(self.after_id)
         self.after_id = self.root.after(REFRESH_MS, self.refresh)
+
+    def refresh_all(self) -> None:
+        self.refresh()
+        self.refresh_openrouter()
+
+    def refresh_openrouter(self) -> None:
+        if self.openrouter_after_id:
+            self.root.after_cancel(self.openrouter_after_id)
+        self.openrouter_after_id = self.root.after(5 * 60_000, self.refresh_openrouter)
+        if self.openrouter_fetching:
+            return
+        key = load_key()
+        if not key:
+            self.openrouter_balance = None
+            self.openrouter_status = "키 설정"
+            self._draw()
+            return
+        self.openrouter_fetching = True
+        self.openrouter_status = "확인 중"
+        self._draw()
+
+        def worker() -> None:
+            try:
+                result = ("ok", fetch_credits(key))
+            except urllib.error.HTTPError as exc:
+                result = ("http", exc.code)
+            except (OSError, ValueError, KeyError, TypeError, InvalidOperation, json.JSONDecodeError):
+                result = ("error", None)
+            try:
+                self.root.after(0, self._apply_openrouter_balance, result)
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_openrouter_balance(self, result: tuple[str, object]) -> None:
+        self.openrouter_fetching = False
+        kind, value = result
+        if kind == "ok":
+            self.openrouter_balance = value
+            self.openrouter_status = "정상"
+        else:
+            self.openrouter_balance = None
+            self.openrouter_status = ("키 확인" if kind == "http" and value in (401, 403)
+                                      else "잠시 후 재시도" if kind == "http" and value == 429
+                                      else "연결 오류")
+        self._draw()
+
+    def openrouter_settings(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("OpenRouter 관리용 키")
+        dialog.geometry("410x180")
+        dialog.resizable(False, False)
+        dialog.configure(bg="#ffffff")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        tk.Label(dialog, text="OpenRouter 관리용 키", bg="#ffffff", fg="#202124",
+                 font=("Malgun Gothic", 11, "bold")).place(x=18, y=16)
+        tk.Label(dialog, text="계정의 남은 크레딧 조회에 필요합니다.", bg="#ffffff", fg="#777777",
+                 font=("Malgun Gothic", 9)).place(x=18, y=47)
+        entry = tk.Entry(dialog, show="●", font=("Segoe UI", 10))
+        entry.place(x=18, y=80, width=374, height=28)
+        tk.Label(dialog, text="기존 위젯의 키도 자동으로 사용합니다. 이 Windows 계정으로 암호화해 저장합니다.",
+                 bg="#ffffff", fg="#777777", font=("Malgun Gothic", 8)).place(x=18, y=115)
+
+        def commit() -> None:
+            value = entry.get().strip()
+            if value:
+                if not value.startswith("sk-or-"):
+                    messagebox.showerror("키 확인", "OpenRouter 키 형식을 확인하세요.", parent=dialog)
+                    return
+                try:
+                    save_key(value)
+                except OSError as exc:
+                    messagebox.showerror("저장 오류", str(exc), parent=dialog)
+                    return
+            dialog.destroy()
+            self.refresh_openrouter()
+
+        tk.Button(dialog, text="저장", command=commit, width=10).place(x=310, y=145)
+        dialog.bind("<Return>", lambda _event: commit())
+        entry.focus_set()
 
     def current_utc(self) -> datetime:
         return self.synced_utc + timedelta(seconds=time.perf_counter() - self.synced_perf)
@@ -489,6 +630,7 @@ class UsageWidget:
         self.fetching = False
         if result:
             self.usage = result.usage
+            self.weekly_usage = result.weekly_usage or self.weekly_usage
             self.reset_count = result.reset_count
             self.reset_credits = result.reset_credits
         self._draw()
@@ -518,6 +660,8 @@ class UsageWidget:
             self.root.after_cancel(self.clock_tick_after_id)
         if self.clock_sync_after_id:
             self.root.after_cancel(self.clock_sync_after_id)
+        if self.openrouter_after_id:
+            self.root.after_cancel(self.openrouter_after_id)
         self.root.destroy()
 
     def run(self) -> None:

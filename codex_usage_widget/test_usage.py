@@ -5,7 +5,8 @@ from pathlib import Path
 
 from datetime import datetime, timezone
 
-from codex_usage_widget import _account_from_payloads, find_latest_usage, format_clock, window_label
+from codex_usage_widget import _account_from_payloads, find_latest_usage, find_latest_windows, format_clock, window_label
+from openrouter_credit import remaining_from_payload
 
 
 class UsageParsingTests(unittest.TestCase):
@@ -26,6 +27,7 @@ class UsageParsingTests(unittest.TestCase):
             self.assertIsNotNone(usage)
             self.assertEqual(usage.remaining_percent, 73)
             self.assertEqual(usage.resets_at, 1786974780)
+            self.assertEqual(find_latest_windows(Path(temp)).weekly.remaining_percent, 55)
 
     def test_window_labels(self):
         self.assertEqual(window_label(43800), "월간 한도")
@@ -35,7 +37,10 @@ class UsageParsingTests(unittest.TestCase):
     def test_parses_reset_credit_details(self):
         usage = {
             "plan_type": "team",
-            "rate_limit": {"primary_window": {"used_percent": 28, "limit_window_seconds": 2628000, "reset_at": 1786974780}},
+            "rate_limit": {
+                "primary_window": {"used_percent": 28, "limit_window_seconds": 18000, "reset_at": 1786974780},
+                "secondary_window": {"used_percent": 55, "limit_window_seconds": 604800, "reset_at": 1787406780},
+            },
         }
         resets = {
             "available_count": 3,
@@ -46,6 +51,7 @@ class UsageParsingTests(unittest.TestCase):
         }
         result = _account_from_payloads(usage, resets)
         self.assertEqual(result.usage.remaining_percent, 72)
+        self.assertEqual(result.weekly_usage.remaining_percent, 45)
         self.assertEqual(result.reset_count, 3)
         self.assertEqual(len(result.reset_credits), 1)
         self.assertEqual(result.reset_credits[0].title, "Full reset")
@@ -54,7 +60,10 @@ class UsageParsingTests(unittest.TestCase):
         moment = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(format_clock(moment, "Asia/Seoul")[0], "09:00:00")
         self.assertEqual(format_clock(moment, "America/Vancouver")[0], "17:00:00")
-        self.assertEqual(format_clock(moment, "Europe/London")[0], "01:00:00")
+        self.assertEqual(format_clock(moment, "Etc/UTC")[0], "00:00:00")
+
+    def test_openrouter_remaining_credit(self):
+        self.assertEqual(remaining_from_payload({"data": {"total_credits": 100.5, "total_usage": 25.75}}), 74.75)
 
     @staticmethod
     def _row(timestamp: str, used: float) -> dict:
@@ -66,8 +75,13 @@ class UsageParsingTests(unittest.TestCase):
                 "rate_limits": {
                     "primary": {
                         "used_percent": used,
-                        "window_minutes": 43800,
+                        "window_minutes": 300,
                         "resets_at": 1786974780,
+                    },
+                    "secondary": {
+                        "used_percent": 45,
+                        "window_minutes": 10080,
+                        "resets_at": 1787406780,
                     },
                     "plan_type": "team",
                 },
